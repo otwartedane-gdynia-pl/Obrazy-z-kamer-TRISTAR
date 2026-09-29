@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TRISTAR – podgląd obrazu z kamery</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #15233b; background: #f5f7fa; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 32px 16px; }
+    main { max-width: 920px; margin: 0 auto; }
+    h1 { margin: 0 0 8px; font-size: clamp(1.7rem, 4vw, 2.5rem); }
+    .lead { margin: 0 0 24px; color: #526077; }
+    .panel { background: #fff; border: 1px solid #dce3ec; border-radius: 14px; padding: 18px; box-shadow: 0 8px 30px rgba(18,38,63,.06); }
+    .controls { display: grid; grid-template-columns: 1fr auto; gap: 12px; margin-bottom: 16px; }
+    select, button { min-height: 44px; border: 1px solid #bdc9d8; border-radius: 9px; padding: 0 12px; font: inherit; background: #fff; }
+    button { cursor: pointer; font-weight: 650; }
+    button:hover { background: #f1f5f9; }
+    .viewer { aspect-ratio: 16 / 9; display: grid; place-items: center; overflow: hidden; border-radius: 10px; background: #e9eef4; }
+    .viewer img { width: 100%; height: 100%; object-fit: contain; display: none; }
+    #message { padding: 24px; text-align: center; color: #526077; }
+    .meta { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 16px; }
+    .meta div { padding: 12px; border-radius: 9px; background: #f5f7fa; min-width: 0; }
+    .meta strong { display: block; font-size: .78rem; color: #6b778c; margin-bottom: 4px; }
+    .meta span { overflow-wrap: anywhere; }
+    .links { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 16px; }
+    a { color: #0759b8; }
+    .progress { height: 4px; margin-top: 18px; background: #e5eaf0; overflow: hidden; border-radius: 99px; }
+    .progress > div { height: 100%; width: 0; background: #ff8a00; }
+    .note { margin-top: 12px; color: #6b778c; font-size: .9rem; }
+    @media (max-width: 650px) { .controls { grid-template-columns: 1fr; } .meta { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Obraz z kamery TRISTAR</h1>
+  <p class="lead">Prosty przykład użycia otwartego API ZDiZ w Gdyni – z minimalnym proxy PHP.</p>
+
+  <section class="panel">
+    <div class="controls">
+      <select id="cameraSelect" aria-label="Wybierz kamerę"><option>Ładowanie listy kamer…</option></select>
+      <button id="refreshButton" type="button">Odśwież teraz</button>
+    </div>
+
+    <div class="viewer">
+      <img id="cameraImage" alt="Aktualny obraz z wybranej kamery TRISTAR">
+      <div id="message">Pobieranie danych…</div>
+    </div>
+
+    <div class="meta">
+      <div><strong>Kamera</strong><span id="cameraName">–</span></div>
+      <div><strong>ID</strong><span id="cameraId">–</span></div>
+      <div><strong>Czas obrazu</strong><span id="insertTime">–</span></div>
+    </div>
+
+    <div class="links">
+      <a id="mapLink" href="#" target="_blank" rel="noopener">Pokaż położenie w OpenStreetMap</a>
+      <a id="imageLink" href="#" target="_blank" rel="noopener">Otwórz sam obraz</a>
+    </div>
+
+    <div class="progress" aria-hidden="true"><div id="progressBar"></div></div>
+    <p class="note">Aplikacja sprawdza nowy obraz co 5 minut. Ręczne odświeżenie jest możliwe w każdej chwili.</p>
+  </section>
+</main>
+
+<script>
+  const PROXY_URL = './api.php';
+  const IMAGE_BASE = 'https://api.zdiz.gdynia.pl';
+  const REFRESH_MS = 5 * 60 * 1000;
+
+  const select = document.querySelector('#cameraSelect');
+  const image = document.querySelector('#cameraImage');
+  const message = document.querySelector('#message');
+  const refreshButton = document.querySelector('#refreshButton');
+  const cameraName = document.querySelector('#cameraName');
+  const cameraId = document.querySelector('#cameraId');
+  const insertTime = document.querySelector('#insertTime');
+  const mapLink = document.querySelector('#mapLink');
+  const imageLink = document.querySelector('#imageLink');
+  const progressBar = document.querySelector('#progressBar');
+
+  let cameras = [];
+  let timer = null;
+
+  async function getJson(path, params = {}) {
+    const url = new URL(PROXY_URL, window.location.href);
+    url.searchParams.set('path', path);
+
+    for (const [key, value] of Object.entries(params)) {
+      url.searchParams.set(key, value);
+    }
+
+    const response = await fetch(url, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  }
+
+  function newestImage(items) {
+    if (!Array.isArray(items) || items.length === 0) return null;
+    return [...items].sort(
+      (a, b) => String(b.insertTime || '').localeCompare(String(a.insertTime || ''))
+    )[0];
+  }
+
+  function setMessage(text) {
+    message.textContent = text;
+    message.hidden = false;
+    image.style.display = 'none';
+  }
+
+  function restartProgress() {
+    progressBar.style.transition = 'none';
+    progressBar.style.width = '0%';
+
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      progressBar.style.transition = `width ${REFRESH_MS}ms linear`;
+      progressBar.style.width = '100%';
+    }));
+  }
+
+  function scheduleRefresh() {
+    clearInterval(timer);
+    timer = setInterval(loadSelectedCamera, REFRESH_MS);
+    restartProgress();
+  }
+
+  async function loadSelectedCamera() {
+    const id = Number(select.value);
+    const camera = cameras.find(c => c.id === id);
+    if (!camera) return;
+
+    cameraName.textContent = camera.name || '–';
+    cameraId.textContent = camera.id;
+
+    const [lon, lat] = camera.location?.coordinates || [];
+
+    if (Number.isFinite(lat) && Number.isFinite(lon)) {
+      mapLink.href =
+        `https://www.openstreetmap.org/?mlat=${encodeURIComponent(lat)}` +
+        `&mlon=${encodeURIComponent(lon)}#map=18/${encodeURIComponent(lat)}/${encodeURIComponent(lon)}`;
+      mapLink.hidden = false;
+    } else {
+      mapLink.hidden = true;
+    }
+
+    setMessage('Pobieranie najnowszego obrazu…');
+
+    try {
+      const items = await getJson('ri/rest/camera_image_data', { cameraId: id });
+      const current = newestImage(items);
+
+      if (!current?.imageUrl) {
+        insertTime.textContent = 'brak obrazu';
+        imageLink.hidden = true;
+        setMessage('API nie zwróciło obrazu dla tej kamery. Wybierz inną kamerę lub spróbuj później.');
+        restartProgress();
+        return;
+      }
+
+      // Sam obraz może być wyświetlany bezpośrednio w <img>.
+      // Proxy jest potrzebne do odczytywania JSON-u przez fetch().
+      const url = new URL(current.imageUrl, IMAGE_BASE).href;
+      const cacheBustedUrl = `${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`;
+
+      image.onload = () => {
+        message.hidden = true;
+        image.style.display = 'block';
+      };
+
+      image.onerror = () => setMessage('Nie udało się wczytać obrazu zwróconego przez API.');
+      image.src = cacheBustedUrl;
+
+      imageLink.href = url;
+      imageLink.hidden = false;
+      insertTime.textContent = current.insertTime || 'brak informacji';
+      restartProgress();
+    } catch (error) {
+      console.error(error);
+      insertTime.textContent = '–';
+      imageLink.hidden = true;
+      setMessage('Nie udało się pobrać danych z API TRISTAR.');
+      restartProgress();
+    }
+  }
+
+  async function init() {
+    try {
+      const data = await getJson('ri/rest/cameras');
+      cameras = Array.isArray(data.cameras) ? data.cameras : [];
+
+      if (!cameras.length) throw new Error('Brak kamer w odpowiedzi API');
+
+      select.replaceChildren(...cameras.map(camera => {
+        const option = document.createElement('option');
+        option.value = camera.id;
+        option.textContent = `${camera.name} (ID ${camera.id})`;
+        return option;
+      }));
+
+      if (cameras.some(c => c.id === 11006)) {
+        select.value = '11006';
+      }
+
+      await loadSelectedCamera();
+      scheduleRefresh();
+    } catch (error) {
+      console.error(error);
+      select.innerHTML = '<option>Nie udało się pobrać listy kamer</option>';
+      select.disabled = true;
+      refreshButton.disabled = true;
+      setMessage('Nie udało się połączyć z API TRISTAR przez proxy.');
+    }
+  }
+
+  select.addEventListener('change', async () => {
+    await loadSelectedCamera();
+    scheduleRefresh();
+  });
+
+  refreshButton.addEventListener('click', async () => {
+    await loadSelectedCamera();
+    scheduleRefresh();
+  });
+
+  init();
+</script>
+</body>
+</html>
